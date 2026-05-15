@@ -1211,49 +1211,55 @@ class _PdfViewerState extends State<PdfViewer>
     }
     if (identical(oldLayout, pending) || oldLayout == pending) return;
 
+    // Capture old state BEFORE swapping _layout so _guessCurrentPageNumber
+    // and _visibleRect both see a consistent old layout + old matrix.
+    final currentPageNumber = _guessCurrentPageNumber();
     final oldVisibleRect = _initialized ? _visibleRect : Rect.zero;
+    final currentZoom = _currentZoom;
+    final oldSnapshot = PdfViewerLayoutSnapshot(
+      viewSize: viewSize,
+      layout: oldLayout,
+      minScale: _layoutMetrics.minScale,
+      coverScale: _layoutMetrics.coverScale,
+      alternativeFitScale: _layoutMetrics.alternativeFitScale,
+    );
 
-    // Anchor priority: an in-flight goto target (e.g. the initial page the
-    // user is opening to) outranks the currently-most-visible page, so the
-    // user stays on the intended page across the swap.
-    final pageCount = pending.pageLayouts.length;
-    final preferredAnchor = _gotoTargetPageNumber ?? _pageNumber;
-    final anchorPage =
-        (preferredAnchor != null &&
-            preferredAnchor >= 1 &&
-            preferredAnchor <= pageCount &&
-            preferredAnchor <= oldLayout.pageLayouts.length)
-        ? preferredAnchor
-        : null;
-
+    // Swap to the new layout and recompute derived state. We're in a
+    // post-frame callback, so the matrix correction below can drive
+    // InteractiveViewer.setState safely.
     _layout = pending;
     _recalculateMetrics();
     _calcZoomStopTable();
-    _adjustBoundaryMargins(viewSize, max(_layoutMetrics.minScale, _currentZoom));
+    _adjustBoundaryMargins(viewSize, max(_layoutMetrics.minScale, currentZoom));
 
-    if (anchorPage != null) {
-      final oldPageRect = oldLayout.pageLayouts[anchorPage - 1];
-      final newPageRect = pending.pageLayouts[anchorPage - 1];
-      final relativeOffset = oldVisibleRect.topLeft - oldPageRect.topLeft;
-      final fracX = oldPageRect.width > 0 ? relativeOffset.dx / oldPageRect.width : 0.0;
-      final fracY = oldPageRect.height > 0 ? relativeOffset.dy / oldPageRect.height : 0.0;
-      final newDocOffset = Offset(
-        newPageRect.left + fracX * newPageRect.width,
-        newPageRect.top + fracY * newPageRect.height,
-      );
-      final zoom = _currentZoom;
-      final m = Matrix4.compose(
-        vec.Vector3(-newDocOffset.dx * zoom, -newDocOffset.dy * zoom, 0),
-        vec.Quaternion.identity(),
-        vec.Vector3(zoom, zoom, zoom),
-      );
-      // setValueWithoutNormalization notifies listeners which schedule the
-      // next frame; we're outside build here so InteractiveViewer.setState
-      // is safe.
-      _txController.setValueWithoutNormalization(_calcMatrixForClampedToNearestBoundary(m, viewSize: viewSize));
-    } else {
-      _invalidate();
-    }
+    final newSnapshot = PdfViewerLayoutSnapshot(
+      viewSize: viewSize,
+      layout: pending,
+      minScale: _layoutMetrics.minScale,
+      coverScale: _layoutMetrics.coverScale,
+      alternativeFitScale: _layoutMetrics.alternativeFitScale,
+    );
+
+    // Defer to the size delegate so the matrix correction uses the same
+    // proportional-anchor logic as the rest of the viewer (smart/legacy).
+    // Prefer the in-flight goto target so the user lands on the page they
+    // requested even before the viewport has visually settled on it.
+    final anchorPageNumber = _gotoTargetPageNumber ?? currentPageNumber;
+    _sizeDelegate?.onLayoutUpdate(
+      oldState: oldSnapshot,
+      newState: newSnapshot,
+      currentZoom: currentZoom,
+      oldVisibleRect: oldVisibleRect,
+      anchorPageNumber: anchorPageNumber,
+      isLayoutChanged: true,
+      isViewSizeChanged: false,
+    );
+
+    // The delegate calls controller.goToPosition which updates the matrix
+    // and triggers _onMatrixChanged -> _invalidate. If the delegate is null
+    // or skipped the update (e.g. no anchor available), still invalidate so
+    // the new layout paints.
+    _invalidate();
   }
 
   void _recalculateMetrics() {

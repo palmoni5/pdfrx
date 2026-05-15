@@ -1,3 +1,7 @@
+# 2.4.0+otzaria.2
+
+- REFINED: The deferred layout swap now drives the size delegate (smart/legacy) for its matrix correction, instead of duplicating proportional-anchor math. This makes the post-swap viewport match what `onLayoutUpdate` would have produced — including the `getClosestPageHit` fallback when the visible top-left straddles a page boundary or sits in a margin — so the user stays on the same content across reflows even in book-view layouts with custom `layoutPages`.
+
 # 2.4.0+otzaria.1
 
 - FIXED: Eliminate the one-frame visual jump that occurred when progressive page loading reflowed the page layout (e.g. while opening a PDF directly to a specific page). The layout swap is now deferred to a post-frame callback so the new page positions and the corrected viewport matrix land in the same frame. The user stays anchored on the in-flight `initialPageNumber` (or the currently visible page) across each reflow.
