@@ -244,6 +244,12 @@ class _PdfViewerState extends State<PdfViewer>
 
   PdfDocument? _document;
   PdfPageLayout? _layout;
+  // Held-back layout result waiting for a post-frame swap (see
+  // [_applyDeferredLayout]). Lets us land the new layout and the matrix
+  // correction in the same frame, eliminating the one-frame jump that the
+  // user otherwise sees when progressive page loading reflows the layout.
+  PdfPageLayout? _deferredLayout;
+  bool _deferredLayoutScheduled = false;
   Size? _viewSize;
   late PdfViewerLayoutMetrics _layoutMetrics;
   int? _pageNumber;
@@ -406,6 +412,8 @@ class _PdfViewerState extends State<PdfViewer>
     if (currentDoc != null && currentDoc == _document) return;
 
     _layout = null;
+    _deferredLayout = null;
+    _deferredLayoutScheduled = false;
     _documentSubscription?.cancel();
     _documentSubscription = null;
     _clearFontManagerAssociation();
@@ -1157,6 +1165,7 @@ class _PdfViewerState extends State<PdfViewer>
   bool _relayoutPages() {
     if (_document == null) {
       _layout = null;
+      _deferredLayout = null;
       return false;
     }
     final newLayout = (widget.params.layoutPages ?? _layoutPages)(_document!.pages, widget.params);
@@ -1164,8 +1173,87 @@ class _PdfViewerState extends State<PdfViewer>
       return false;
     }
 
+    // Defer the swap when we already have a layout — apply it together with
+    // a matrix correction in a post-frame callback so the new page positions
+    // and the viewport scroll land in the same frame. Without this, the
+    // current frame paints the new layout with the stale (pre-correction)
+    // matrix and the user sees a one-frame jump. Most visible while
+    // progressive page loading replaces estimated page sizes with real ones.
+    if (_initialized && _layout != null) {
+      _deferredLayout = newLayout;
+      _scheduleDeferredLayoutApply();
+      return false;
+    }
+
     _layout = newLayout;
+    _deferredLayout = null;
     return true;
+  }
+
+  void _scheduleDeferredLayoutApply() {
+    if (_deferredLayoutScheduled) return;
+    _deferredLayoutScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _applyDeferredLayout());
+  }
+
+  void _applyDeferredLayout() {
+    _deferredLayoutScheduled = false;
+    if (!mounted) return;
+    final pending = _deferredLayout;
+    _deferredLayout = null;
+    if (pending == null) return;
+    final viewSize = _viewSize;
+    final oldLayout = _layout;
+    if (viewSize == null || oldLayout == null || _document == null) {
+      _layout = pending;
+      _invalidate();
+      return;
+    }
+    if (identical(oldLayout, pending) || oldLayout == pending) return;
+
+    final oldVisibleRect = _initialized ? _visibleRect : Rect.zero;
+
+    // Anchor priority: an in-flight goto target (e.g. the initial page the
+    // user is opening to) outranks the currently-most-visible page, so the
+    // user stays on the intended page across the swap.
+    final pageCount = pending.pageLayouts.length;
+    final preferredAnchor = _gotoTargetPageNumber ?? _pageNumber;
+    final anchorPage =
+        (preferredAnchor != null &&
+            preferredAnchor >= 1 &&
+            preferredAnchor <= pageCount &&
+            preferredAnchor <= oldLayout.pageLayouts.length)
+        ? preferredAnchor
+        : null;
+
+    _layout = pending;
+    _recalculateMetrics();
+    _calcZoomStopTable();
+    _adjustBoundaryMargins(viewSize, max(_layoutMetrics.minScale, _currentZoom));
+
+    if (anchorPage != null) {
+      final oldPageRect = oldLayout.pageLayouts[anchorPage - 1];
+      final newPageRect = pending.pageLayouts[anchorPage - 1];
+      final relativeOffset = oldVisibleRect.topLeft - oldPageRect.topLeft;
+      final fracX = oldPageRect.width > 0 ? relativeOffset.dx / oldPageRect.width : 0.0;
+      final fracY = oldPageRect.height > 0 ? relativeOffset.dy / oldPageRect.height : 0.0;
+      final newDocOffset = Offset(
+        newPageRect.left + fracX * newPageRect.width,
+        newPageRect.top + fracY * newPageRect.height,
+      );
+      final zoom = _currentZoom;
+      final m = Matrix4.compose(
+        vec.Vector3(-newDocOffset.dx * zoom, -newDocOffset.dy * zoom, 0),
+        vec.Quaternion.identity(),
+        vec.Vector3(zoom, zoom, zoom),
+      );
+      // setValueWithoutNormalization notifies listeners which schedule the
+      // next frame; we're outside build here so InteractiveViewer.setState
+      // is safe.
+      _txController.setValueWithoutNormalization(_calcMatrixForClampedToNearestBoundary(m, viewSize: viewSize));
+    } else {
+      _invalidate();
+    }
   }
 
   void _recalculateMetrics() {

@@ -1,3 +1,7 @@
+# 2.4.0+otzaria.1
+
+- FIXED: Eliminate the one-frame visual jump that occurred when progressive page loading reflowed the page layout (e.g. while opening a PDF directly to a specific page). The layout swap is now deferred to a post-frame callback so the new page positions and the corrected viewport matrix land in the same frame. The user stays anchored on the in-flight `initialPageNumber` (or the currently visible page) across each reflow.
+
 # 2.4.0
 
 - NEW: Added [PdfOverlayInteractionRegion](https://pub.dev/documentation/pdfrx/latest/pdfrx/PdfOverlayInteractionRegion-class.html) for tap-like interactions on page/viewer overlays without blocking viewer pan, zoom, text selection, or link handling ([#376](https://github.com/espresso3389/pdfrx/issues/376)).
