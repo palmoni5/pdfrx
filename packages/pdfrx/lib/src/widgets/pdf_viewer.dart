@@ -342,6 +342,7 @@ class _PdfViewerState extends State<PdfViewer>
   @override
   void initState() {
     super.initState();
+    _imageBudget.addListener(_onImageBudgetChanged);
     SemanticsBinding.instance.addSemanticsEnabledListener(_onSemanticsEnabledChanged);
     _viewerInstanceId = ++_viewerInstanceCounter;
     if (Pdfrx.debugLazyLoading) {
@@ -368,6 +369,8 @@ class _PdfViewerState extends State<PdfViewer>
   void didUpdateWidget(covariant PdfViewer oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (!identical(widget.params.imageCacheBudget, oldWidget.params.imageCacheBudget)) {
+      (oldWidget.params.imageCacheBudget ?? _localImageBudget).removeListener(_onImageBudgetChanged);
+      _imageBudget.addListener(_onImageBudgetChanged);
       _imageCache.releaseAllImages();
       _magnifierImageCache.releaseAllImages();
     }
@@ -626,6 +629,8 @@ class _PdfViewerState extends State<PdfViewer>
 
   @override
   void dispose() {
+    _imageBudget.removeListener(_onImageBudgetChanged);
+    _localImageBudget.dispose();
     _textCacheLease?.dispose();
     _selectionHandleTicker?.dispose();
     SemanticsBinding.instance.removeSemanticsEnabledListener(_onSemanticsEnabledChanged);
@@ -1702,8 +1707,13 @@ class _PdfViewerState extends State<PdfViewer>
   /// [_CustomPainter] calls the function to paint PDF pages.
   void _paintPages(ui.Canvas canvas, ui.Size size) {
     if (!_initialized || !widget.params.isVisible) return;
-    for (final image in [..._magnifierImageCache.pageImages.values, ..._magnifierImageCache.pageImagesPartial.values]) {
-      image.budgetEntry?.touch(isPinned: false);
+    if (_selPartMoving == _TextSelectionPart.none || _magnifierRect == null) {
+      for (final image in [
+        ..._magnifierImageCache.pageImages.values,
+        ..._magnifierImageCache.pageImagesPartial.values,
+      ]) {
+        image.budgetEntry?.touch(isPinned: false);
+      }
     }
     _updateTextCachePins();
     _paintPagesCustom(
@@ -1716,6 +1726,10 @@ class _PdfViewerState extends State<PdfViewer>
       enableLowResolutionPagePreview: widget.params.behaviorControlParams.enableLowResolutionPagePreview,
       filterQuality: FilterQuality.low,
     );
+  }
+
+  void _onImageBudgetChanged() {
+    if (mounted && widget.params.isVisible) _invalidate();
   }
 
   void _updateTextCachePins({bool keepVisible = true, bool keepSelection = true}) {
@@ -1804,6 +1818,7 @@ class _PdfViewerState extends State<PdfViewer>
         getPageRenderingScale(context, page, _controller!, _sizeDelegate!.onePassRenderingScaleThreshold),
         page.width,
         page.height,
+        visiblePageCount: cache.visiblePageNumbers.length,
       );
 
       if (dropShadowPaint != null) {
@@ -1902,6 +1917,11 @@ class _PdfViewerState extends State<PdfViewer>
       if (aVisible != bVisible) return aVisible ? -1 : 1;
       return _distanceToRect(a.rect, targetRect).compareTo(_distanceToRect(b.rect, targetRect));
     });
+    if (previewRequests.any((request) => cache.visiblePageNumbers.contains(request.page.pageNumber))) {
+      for (final pageNumber in cache.pendingPageNumbers.toList()) {
+        if (!cache.visiblePageNumbers.contains(pageNumber)) cache.cancelPendingRenderings(pageNumber);
+      }
+    }
     for (final request in previewRequests) {
       _requestPagePreviewImageCached(cache, request.page, request.scale);
     }
@@ -2172,9 +2192,9 @@ class _PdfViewerState extends State<PdfViewer>
     return dx * dx + dy * dy;
   }
 
-  double _boundedRenderingScale(double scale, double width, double height) {
+  double _boundedRenderingScale(double scale, double width, double height, {int visiblePageCount = 1}) {
     if (!scale.isFinite || scale <= 0 || !width.isFinite || !height.isFinite || width <= 0 || height <= 0) return 0;
-    final maxPixels = max(1, _imageBudget.maximumBytes ~/ 12);
+    final maxPixels = max(1, _imageBudget.maximumBytes ~/ (12 * max(1, visiblePageCount)));
     return min(scale, sqrt(maxPixels / (width * height)));
   }
 
@@ -2240,19 +2260,15 @@ class _PdfViewerState extends State<PdfViewer>
 
     cache.addCancellationToken(page.pageNumber, cancellationToken);
 
-    // Every preview render in this viewer queues on one lock (the extension is
-    // keyed on the cache object), so a page can sit here for as long as all the
-    // pages ahead of it take. Time the wait separately from the render to tell
-    // "slow to draw" apart from "stuck in the queue".
+    // The engine must receive requests directly so visible work can overtake queued prefetches.
     final sw = Pdfrx.debugLazyLoading ? (Stopwatch()..start()) : null;
     final bytesAtRequest = Pdfrx.debugBytesFetched;
     try {
-      await cache.synchronized(() async {
-        final waitedMs = sw?.elapsedMilliseconds ?? 0;
+      await Future<void>.sync(() async {
         if (!mounted || !widget.params.isVisible || cancellationToken.isCanceled) {
           if (sw != null) {
             pdfrxLazyLog(
-              '#$_viewerInstanceId RENDER p${page.pageNumber} abandoned after ${waitedMs}ms in queue '
+              '#$_viewerInstanceId RENDER p${page.pageNumber} abandoned before render '
               '(${!mounted ? 'viewer gone' : 'cancelled -- page left the cache extent'})',
             );
           }
@@ -2262,7 +2278,7 @@ class _PdfViewerState extends State<PdfViewer>
         if (prev != null && !prev.isDirty && prev.scale == scale) return;
         final reservation = _imageBudget.tryReserve(
           (max(1, width.toInt()) * max(1, height.toInt()) * 12).toInt(),
-          allowOverBudget: cache.visiblePageNumbers.contains(page.pageNumber),
+          allowOverBudget: cache.visiblePageNumbers.contains(page.pageNumber) && _imageBudget.pendingBytes == 0,
         );
         if (reservation == null) return;
         PdfImage? img;
@@ -2274,6 +2290,9 @@ class _PdfViewerState extends State<PdfViewer>
             annotationRenderingMode: widget.params.annotationRenderingMode,
             flags: widget.params.limitRenderingCache ? PdfPageRenderFlags.limitedImageCache : PdfPageRenderFlags.none,
             cancellationToken: cancellationToken,
+            priority: cache.visiblePageNumbers.contains(page.pageNumber)
+                ? PdfPageRenderPriority.high
+                : PdfPageRenderPriority.low,
           );
           if (img == null || !mounted || !widget.params.isVisible || cancellationToken.isCanceled) {
             if (sw != null) {
@@ -2286,7 +2305,7 @@ class _PdfViewerState extends State<PdfViewer>
                   : (!mounted ? 'viewer gone' : 'cancelled mid-render');
               pdfrxLazyLog(
                 '#$_viewerInstanceId RENDER p${page.pageNumber} FAILED -- $why '
-                '(queued ${waitedMs}ms, total ${sw.elapsedMilliseconds}ms)',
+                '(total ${sw.elapsedMilliseconds}ms)',
               );
             }
             return;
@@ -2307,7 +2326,7 @@ class _PdfViewerState extends State<PdfViewer>
             final fetched = Pdfrx.debugBytesFetched - bytesAtRequest;
             pdfrxLazyLog(
               '#$_viewerInstanceId RENDER p${page.pageNumber} ok ${width.round()}x${height.round()} '
-              'in ${sw.elapsedMilliseconds - waitedMs}ms (queued ${waitedMs}ms)  '
+              'in ${sw.elapsedMilliseconds}ms including engine queue  '
               '${fetched > 0 ? 'NETWORK ${(fetched / 1024).toStringAsFixed(0)}KB' : 'cache hit'}',
             );
           }
@@ -2341,7 +2360,7 @@ class _PdfViewerState extends State<PdfViewer>
     if (!mounted || !widget.params.isVisible) return;
     final pageRect = _layout!.pageLayouts[page.pageNumber - 1];
     final rect = pageRect.intersect(targetRect);
-    scale = _boundedRenderingScale(scale, rect.width, rect.height);
+    scale = _boundedRenderingScale(scale, rect.width, rect.height, visiblePageCount: cache.visiblePageNumbers.length);
     final prev = cache.pageImagesPartial[page.pageNumber];
     if (prev != null && !prev.isDirty && prev.rect == rect && prev.scale == scale) return;
     if (rect.width < 1 || rect.height < 1) return;
@@ -2403,7 +2422,7 @@ class _PdfViewerState extends State<PdfViewer>
     PdfImage? img;
     final reservation = _imageBudget.tryReserve(
       width * height * 12,
-      allowOverBudget: cache.visiblePageNumbers.contains(page.pageNumber),
+      allowOverBudget: cache.visiblePageNumbers.contains(page.pageNumber) && _imageBudget.pendingBytes == 0,
     );
     if (reservation == null) return null;
     try {
@@ -2418,6 +2437,7 @@ class _PdfViewerState extends State<PdfViewer>
         annotationRenderingMode: widget.params.annotationRenderingMode,
         flags: flags,
         cancellationToken: cancellationToken,
+        priority: PdfPageRenderPriority.high,
       );
       if (img == null || !mounted || cancellationToken.isCanceled) return null;
       final image = _PdfImageWithScaleAndRect(
