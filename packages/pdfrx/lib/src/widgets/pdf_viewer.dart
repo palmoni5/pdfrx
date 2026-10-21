@@ -2285,6 +2285,10 @@ class _PdfViewerState extends State<PdfViewer>
     final prev = cache.pageImagesPartial[page.pageNumber];
     if (prev != null && !prev.isDirty && prev.rect == rect && prev.scale == scale) return;
     if (rect.width < 1 || rect.height < 1) return;
+    final pending = cache.pageImagePartialRenderingRequests[page.pageNumber];
+    if (pending != null && pending.rect == rect && pending.scale == scale && !pending.cancellationToken.isCanceled) {
+      return;
+    }
 
     cache.pageImagePartialRenderingRequests[page.pageNumber]?.cancel();
 
@@ -2310,6 +2314,8 @@ class _PdfViewerState extends State<PdfViewer>
         }
       }),
       cancellationToken,
+      rect,
+      scale,
     );
     cache.pageImagePartialRenderingRequests[page.pageNumber] = request;
   }
@@ -4432,9 +4438,11 @@ class _PdfPageImageCache {
 }
 
 class _PdfPartialImageRenderingRequest {
-  _PdfPartialImageRenderingRequest(this.timer, this.cancellationToken);
+  _PdfPartialImageRenderingRequest(this.timer, this.cancellationToken, this.rect, this.scale);
   final Timer timer;
   final PdfPageRenderCancellationToken cancellationToken;
+  final Rect rect;
+  final double scale;
 
   void cancel() {
     timer.cancel();
